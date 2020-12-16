@@ -8,6 +8,7 @@ import (
 	"time"
 )
 
+// Amb 取最新发出数据的那个流
 // Amb takes several Observables, emit all of the items from only the first of these Observables
 // to emit an item or notification.
 func Amb(observables []Observable, opts ...Option) Observable {
@@ -69,9 +70,9 @@ func CombineLatest(f FuncN, observables []Observable, opts ...Option) Observable
 	next := option.buildChannel()
 
 	go func() {
-		size := uint32(len(observables))
+		size := uint32(len(observables)) // 流个数
 		var counter uint32
-		s := make([]interface{}, size)
+		s := make([]interface{}, size) // 用一个slice来接收每个流的最新发出的数据，slice里的数据顺序和流的顺序一致
 		mutex := sync.Mutex{}
 		wg := sync.WaitGroup{}
 		wg.Add(int(size))
@@ -85,21 +86,21 @@ func CombineLatest(f FuncN, observables []Observable, opts ...Option) Observable
 				case <-ctx.Done():
 					return
 				case item, ok := <-observe:
-					if !ok {
+					if !ok { // 流完结，直接退出后台协程
 						return
 					}
-					if item.Error() {
+					if item.Error() { // 发生错误，需要发出这个错误，并且通知有错误
 						next <- item
 						errCh <- struct{}{}
 						return
 					}
-					if s[i] == nil {
+					if s[i] == nil { // 没有发生错误，统计成功发出数据的流数量
 						atomic.AddUint32(&counter, 1)
 					}
 					mutex.Lock()
 					s[i] = item.V
-					if atomic.LoadUint32(&counter) == size {
-						next <- Of(f(s...))
+					if atomic.LoadUint32(&counter) == size { // 所有流均发出数据
+						next <- Of(f(s...)) // 合并所有流发出数据，然后将得到的合并后的数据作为新流发出
 					}
 					mutex.Unlock()
 				}
@@ -111,6 +112,7 @@ func CombineLatest(f FuncN, observables []Observable, opts ...Option) Observable
 			go handler(ctx, o, i)
 		}
 
+		// 监听是否有错误，如果有错误，退出所有后台协程
 		go func() {
 			for range errCh {
 				cancel()

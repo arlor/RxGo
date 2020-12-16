@@ -41,6 +41,7 @@ type execution struct {
 	isTick bool
 }
 
+// timeCausality 创建一个流，延迟发出所有入参，如果是tick，则duration为nanosecond，如果是其他，则duration为minute 【测试用】
 func timeCausality(elems ...interface{}) (context.Context, Observable, Duration) {
 	ch := make(chan Item, 1)
 	fs := make([]execution, len(elems)+1)

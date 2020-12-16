@@ -95,11 +95,13 @@ type ObservableImpl struct {
 	iterable Iterable
 }
 
+// defaultErrorFuncOperator 默认错误处理方式，发出错误，停止迭代
 func defaultErrorFuncOperator(ctx context.Context, item Item, dst chan<- Item, operatorOptions operatorOptions) {
 	item.SendContext(ctx, dst)
 	operatorOptions.stop()
 }
 
+// customObservableOperator 自定义流操作，分为立即执行和延迟执行
 func customObservableOperator(f func(ctx context.Context, next chan Item, option Option, opts ...Option), opts ...Option) Observable {
 	option := parseOptions(opts...)
 
@@ -133,17 +135,21 @@ func observable(iterable Iterable, operatorFactory func() operator, forceSeq, by
 	option := parseOptions(opts...)
 	parallel, _ := option.getPool()
 
+	// 立即生产
 	if option.isEagerObservation() {
 		next := option.buildChannel()
 		ctx := option.buildContext()
+		// 强制串行或者非并发，那就串行运行
 		if forceSeq || !parallel {
 			runSequential(ctx, next, iterable, operatorFactory, option, opts...)
 		} else {
+			// 否则并发运行
 			runParallel(ctx, next, iterable.Observe(opts...), operatorFactory, bypassGather, option, opts...)
 		}
 		return &ObservableImpl{iterable: newChannelIterable(next)}
 	}
 
+	// 延迟串行运行
 	if forceSeq || !parallel {
 		return &ObservableImpl{
 			iterable: newFactoryIterable(func(propagatedOptions ...Option) <-chan Item {
@@ -158,6 +164,7 @@ func observable(iterable Iterable, operatorFactory func() operator, forceSeq, by
 		}
 	}
 
+	// 将并行结果有序化
 	if serialized, f := option.isSerialized(); serialized {
 		firstItemIDCh := make(chan Item, 1)
 		fromCh := make(chan Item, 1)
@@ -173,12 +180,14 @@ func observable(iterable Iterable, operatorFactory func() operator, forceSeq, by
 					select {
 					case <-ctx.Done():
 						return
-					case firstItemID := <-firstItemIDCh:
+					case firstItemID := <-firstItemIDCh: // 上游发出第一个元素的index，用此index触发serialize和runParallel
+						// 如果错误，发出item，如果正常，发出id
 						if firstItemID.Error() {
 							firstItemID.SendContext(ctx, fromCh)
 							return
 						}
 						Of(firstItemID.V.(int)).SendContext(ctx, fromCh)
+						// 并发执行
 						runParallel(ctx, next, observe, operatorFactory, bypassGather, option, mergedOptions...)
 					}
 				}()
@@ -189,6 +198,7 @@ func observable(iterable Iterable, operatorFactory func() operator, forceSeq, by
 		return obs.serialize(fromCh, f)
 	}
 
+	// 延迟并行运行
 	return &ObservableImpl{
 		iterable: newFactoryIterable(func(propagatedOptions ...Option) <-chan Item {
 			mergedOptions := append(opts, propagatedOptions...)
@@ -266,6 +276,7 @@ func optionalSingle(iterable Iterable, operatorFactory func() operator, forceSeq
 	}
 }
 
+// runSequential 对流里每个元素顺序执行传入的operator操作，并将执行结果作为新流的元素发出
 func runSequential(ctx context.Context, next chan Item, iterable Iterable, operatorFactory func() operator, option Option, opts ...Option) {
 	observe := iterable.Observe(opts...)
 	go func() {
@@ -303,11 +314,23 @@ func runSequential(ctx context.Context, next chan Item, iterable Iterable, opera
 	}()
 }
 
+// runParallel 对流里每个元素并行执行传入的operator操作，并将执行结果作为新流的元素发出
+/*
+思考：
+	为什么runParallel相比runSequential多了一个忽略收集（bypassGather）的参数
+原因：
+	因为并发运行的时候，可能涉及到修改operator对象的内部参数，这时需要考虑竞态条件，
+通过gather（chan Item），可以将并发执行得到的结果进行串行处理，避免了加锁操作。
+而runSequential本身就是串行的，因此不需要多此一举。
+
+*/
 func runParallel(ctx context.Context, next chan Item, observe <-chan Item, operatorFactory func() operator, bypassGather bool, option Option, opts ...Option) {
 	wg := sync.WaitGroup{}
 	_, pool := option.getPool()
 	wg.Add(pool)
 
+	// 如果忽略收集（bypassGather），则所有流发出所有数据直接进入next
+	// 否则，所有数据要先经过gather，然后才经过next
 	var gather chan Item
 	if bypassGather {
 		gather = next
@@ -315,6 +338,7 @@ func runParallel(ctx context.Context, next chan Item, observe <-chan Item, opera
 		gather = make(chan Item, 1)
 
 		// Gather
+		// 收集并发处理的流本身发出的数据
 		go func() {
 			op := operatorFactory()
 			stopped := false
@@ -344,8 +368,11 @@ func runParallel(ctx context.Context, next chan Item, observe <-chan Item, opera
 	}
 
 	// Scatter
+	// 分散流里的元素，并发执行，然后将结果作为新流里的元素发出
 	for i := 0; i < pool; i++ {
 		go func() {
+			// 这里使用工厂，所以每次返回operator都是不同的对象
+			// 对operator进行赋值操作时则不存在并发风险
 			op := operatorFactory()
 			stopped := false
 			operator := operatorOptions{
@@ -364,6 +391,7 @@ func runParallel(ctx context.Context, next chan Item, observe <-chan Item, opera
 				case <-ctx.Done():
 					return
 				case item, ok := <-observe:
+					// 当前流结束，并且不省略收集，则将operator本身作为元素发出
 					if !ok {
 						if !bypassGather {
 							Of(op).SendContext(ctx, gather)
@@ -386,12 +414,14 @@ func runParallel(ctx context.Context, next chan Item, observe <-chan Item, opera
 	}()
 }
 
+// runFirstItem 后台异步找到流发出元素的index发出到notif，并将元素向下游流发出
 func runFirstItem(ctx context.Context, f func(interface{}) int, notif chan Item, observe <-chan Item, next chan Item, operatorFactory func() operator, option Option, opts ...Option) {
 	go func() {
 		op := operatorFactory()
 		stopped := false
 		operator := operatorOptions{
 			stop: func() {
+				// 发生错误，立即停止
 				if option.getErrorStrategy() == StopOnError {
 					stopped = true
 				}
@@ -407,15 +437,15 @@ func runFirstItem(ctx context.Context, f func(interface{}) int, notif chan Item,
 			case <-ctx.Done():
 				break loop
 			case i, ok := <-observe:
-				if !ok {
+				if !ok { // 上游流完结，跳出
 					break loop
 				}
 				if i.Error() {
-					op.err(ctx, i, next, operator)
-					i.SendContext(ctx, notif)
+					op.err(ctx, i, next, operator) // 向中游发出错误
+					i.SendContext(ctx, notif)      // 向firstItemIDCh发出上游错误
 				} else {
-					op.next(ctx, i, next, operator)
-					Of(f(i.V)).SendContext(ctx, notif)
+					op.next(ctx, i, next, operator)    // 向中游发出元素
+					Of(f(i.V)).SendContext(ctx, notif) // 向firstItemIDCh发出上游元素的index
 				}
 			}
 		}
@@ -423,6 +453,7 @@ func runFirstItem(ctx context.Context, f func(interface{}) int, notif chan Item,
 	}()
 }
 
+// serialize rxgo.Serialize选项，对本流发出的结果进行有序化处理
 func (o *ObservableImpl) serialize(fromCh chan Item, identifier func(interface{}) int, opts ...Option) Observable {
 	option := parseOptions(opts...)
 	next := option.buildChannel()
@@ -441,14 +472,14 @@ func (o *ObservableImpl) serialize(fromCh chan Item, identifier func(interface{}
 		case <-ctx.Done():
 			close(next)
 			return
-		case item := <-fromCh:
+		case item := <-fromCh: // runFirstItem触发firstItemIDCh，然后才触发fromCh
 			if item.Error() {
 				item.SendContext(ctx, next)
 				close(next)
 				return
 			}
 			from = item.V.(int)
-			counter = int64(from)
+			counter = int64(from) // 首个发出元素的index
 
 			go func() {
 				defer close(next)
@@ -457,7 +488,7 @@ func (o *ObservableImpl) serialize(fromCh chan Item, identifier func(interface{}
 					select {
 					case <-ctx.Done():
 						return
-					case item, ok := <-src:
+					case item, ok := <-src: // 从中游获取元素
 						if !ok {
 							return
 						}
@@ -466,19 +497,19 @@ func (o *ObservableImpl) serialize(fromCh chan Item, identifier func(interface{}
 							return
 						}
 
-						id := identifier(item.V)
-						minHeap.Push(id)
-						items[id] = item.V
+						id := identifier(item.V) // 获取元素的index
+						minHeap.Push(id)         // 将index放入小根堆
+						items[id] = item.V       // 获取元素与id的映射
 
 						for !minHeap.Empty() {
 							v, _ := minHeap.Peek()
-							id := v.(int)
+							id := v.(int) // 最小index
 							if atomic.LoadInt64(&counter) == int64(id) {
 								if itemValue, contains := items[id]; contains {
 									minHeap.Pop()
 									delete(items, id)
-									Of(itemValue).SendContext(ctx, next)
-									counter++
+									Of(itemValue).SendContext(ctx, next) // 发出index对应的元素
+									counter++                            // 索引值增加
 									continue
 								}
 							}

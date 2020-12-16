@@ -30,6 +30,7 @@ func (s *SingleImpl) Get(opts ...Option) (Item, error) {
 	ctx := option.buildContext()
 
 	observe := s.Observe(opts...)
+	// NOTE select会阻塞在case上，不会无限for循环导致cpu空转
 	for {
 		select {
 		case <-ctx.Done():

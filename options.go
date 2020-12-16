@@ -43,10 +43,12 @@ func (fdo *funcOption) isEagerObservation() bool {
 	return fdo.observation == Eager
 }
 
+// getPool 是否并发，已经并发数
 func (fdo *funcOption) getPool() (bool, int) {
 	return fdo.pool > 0, fdo.pool
 }
 
+// buildChannel 按照策略创建channel
 func (fdo *funcOption) buildChannel() chan Item {
 	if fdo.isBuffer {
 		return make(chan Item, fdo.buffer)
@@ -54,6 +56,7 @@ func (fdo *funcOption) buildChannel() chan Item {
 	return make(chan Item)
 }
 
+// buildContext 如果有context，反返回传入的context；否则返回context.Background()
 func (fdo *funcOption) buildContext() context.Context {
 	if fdo.ctx == nil {
 		return context.Background()
@@ -81,6 +84,7 @@ func (fdo *funcOption) apply(do *funcOption) {
 	fdo.f(do)
 }
 
+// isSerialized 是否有顺序，每个元素的顺序值是多少
 func (fdo *funcOption) isSerialized() (bool, func(interface{}) int) {
 	if fdo.serialized == nil {
 		return false, nil
@@ -94,6 +98,7 @@ func newFuncOption(f func(*funcOption)) *funcOption {
 	}
 }
 
+// parseOptions 解析所有option，得到最终的Option
 func parseOptions(opts ...Option) Option {
 	o := new(funcOption)
 	for _, opt := range opts {

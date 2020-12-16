@@ -28,24 +28,29 @@ type allOperator struct {
 	all       bool
 }
 
+// next 迭代函数
 func (op *allOperator) next(ctx context.Context, item Item, dst chan<- Item, operatorOptions operatorOptions) {
+	// 断言错误，最终结果为false，立即停止执行
 	if !op.predicate(item.V) {
 		Of(false).SendContext(ctx, dst)
-		op.all = false
+		op.all = false // 串行运行时有用，next和end公用一个op，这样end不会发出元素
 		operatorOptions.stop()
 	}
 }
 
+// err 错误处理函数
 func (op *allOperator) err(ctx context.Context, item Item, dst chan<- Item, operatorOptions operatorOptions) {
 	defaultErrorFuncOperator(ctx, item, dst, operatorOptions)
 }
 
+// end 终结处理函数
 func (op *allOperator) end(ctx context.Context, dst chan<- Item) {
 	if op.all {
 		Of(true).SendContext(ctx, dst)
 	}
 }
 
+// gatherNext 迭代收集函数
 func (op *allOperator) gatherNext(ctx context.Context, item Item, dst chan<- Item, operatorOptions operatorOptions) {
 	if item.V == false {
 		Of(false).SendContext(ctx, dst)
@@ -66,6 +71,7 @@ type averageFloat32Operator struct {
 	count float32
 }
 
+// next 计算每个并发任务的sum和count
 func (op *averageFloat32Operator) next(ctx context.Context, item Item, dst chan<- Item, operatorOptions operatorOptions) {
 	switch v := item.V.(type) {
 	default:
@@ -87,6 +93,7 @@ func (op *averageFloat32Operator) err(ctx context.Context, item Item, dst chan<-
 	defaultErrorFuncOperator(ctx, item, dst, operatorOptions)
 }
 
+// end 计算汇总的平均值
 func (op *averageFloat32Operator) end(ctx context.Context, dst chan<- Item) {
 	if op.count == 0 {
 		Of(0).SendContext(ctx, dst)
@@ -95,6 +102,7 @@ func (op *averageFloat32Operator) end(ctx context.Context, dst chan<- Item) {
 	}
 }
 
+// gatherNext 将所有并发任务的sum和count汇总
 func (op *averageFloat32Operator) gatherNext(_ context.Context, item Item, _ chan<- Item, _ operatorOptions) {
 	v := item.V.(*averageFloat32Operator)
 	op.sum += v.sum
@@ -1109,46 +1117,84 @@ func (op *firstOrDefaultOperator) end(ctx context.Context, dst chan<- Item) {
 func (op *firstOrDefaultOperator) gatherNext(_ context.Context, _ Item, _ chan<- Item, _ operatorOptions) {
 }
 
+// // FlatMap transforms the items emitted by an Observable into Observables, then flatten the emissions from those into a single Observable.
+// func (o *ObservableImpl) FlatMap(apply ItemToObservable, opts ...Option) Observable {
+// 	f := func(ctx context.Context, next chan Item, option Option, opts ...Option) {
+// 		defer close(next)
+// 		observe := o.Observe(opts...)
+// 		for {
+// 			select {
+// 			case <-ctx.Done():
+// 				return
+// 			case item, ok := <-observe:
+// 				if !ok {
+// 					return
+// 				}
+// 				observe2 := apply(item).Observe(opts...)
+// 			loop2:
+// 				for {
+// 					select {
+// 					case <-ctx.Done():
+// 						return
+// 					case item, ok := <-observe2:
+// 						if !ok {
+// 							break loop2
+// 						}
+// 						if item.Error() {
+// 							item.SendContext(ctx, next)
+// 							if option.getErrorStrategy() == StopOnError {
+// 								return
+// 							}
+// 						} else {
+// 							if !item.SendContext(ctx, next) {
+// 								return
+// 							}
+// 						}
+// 					}
+// 				}
+// 			}
+// 		}
+// 	}
+
+// 	return customObservableOperator(f, opts...)
+// }
+
 // FlatMap transforms the items emitted by an Observable into Observables, then flatten the emissions from those into a single Observable.
 func (o *ObservableImpl) FlatMap(apply ItemToObservable, opts ...Option) Observable {
-	f := func(ctx context.Context, next chan Item, option Option, opts ...Option) {
-		defer close(next)
-		observe := o.Observe(opts...)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case item, ok := <-observe:
-				if !ok {
-					return
-				}
-				observe2 := apply(item).Observe(opts...)
-			loop2:
-				for {
-					select {
-					case <-ctx.Done():
-						return
-					case item, ok := <-observe2:
-						if !ok {
-							break loop2
-						}
-						if item.Error() {
-							item.SendContext(ctx, next)
-							if option.getErrorStrategy() == StopOnError {
-								return
-							}
-						} else {
-							if !item.SendContext(ctx, next) {
-								return
-							}
-						}
-					}
-				}
-			}
-		}
-	}
+	return observable(o, func() operator {
+		return &flatMapOperator{apply: apply}
+	}, false, true, opts...)
+}
 
-	return customObservableOperator(f, opts...)
+type flatMapOperator struct {
+	apply ItemToObservable
+}
+
+func (op *flatMapOperator) next(ctx context.Context, item Item, dst chan<- Item, operatorOptions operatorOptions) {
+	observe2 := op.apply(item).Observe()
+	for item := range observe2 {
+		if item.E != nil {
+			Error(item.E).SendContext(ctx, dst)
+			operatorOptions.stop()
+			return
+		}
+		Of(item.V).SendContext(ctx, dst)
+	}
+}
+
+func (op *flatMapOperator) err(ctx context.Context, item Item, dst chan<- Item, operatorOptions operatorOptions) {
+	defaultErrorFuncOperator(ctx, item, dst, operatorOptions)
+}
+
+func (op *flatMapOperator) end(_ context.Context, _ chan<- Item) {
+}
+
+func (op *flatMapOperator) gatherNext(ctx context.Context, item Item, dst chan<- Item, _ operatorOptions) {
+	switch item.V.(type) {
+	case *flatMapOperator:
+		return
+	}
+	item.SendContext(ctx, dst)
 }
 
 // ForEach subscribes to the Observable and receives notifications for each element.
@@ -2075,6 +2121,7 @@ func (o *ObservableImpl) SequenceEqual(iterable Iterable, opts ...Option) Single
 }
 
 // Serialize forces an Observable to make serialized calls and to be well-behaved.
+// 发生在流处理之后
 func (o *ObservableImpl) Serialize(from int, identifier func(interface{}) int, opts ...Option) Observable {
 	option := parseOptions(opts...)
 	next := option.buildChannel()
@@ -2107,6 +2154,8 @@ func (o *ObservableImpl) Serialize(from int, identifier func(interface{}) int, o
 				minHeap.Push(id)
 				items[id] = item.V
 
+				// 这是一个小根堆，有可能先push仅较大的值，push了一些值，之后才push到对应的from
+				// 这时需要for循环把之前push进的较大值从小到大依次取出
 				for !minHeap.Empty() {
 					v, _ := minHeap.Peek()
 					id := v.(int)
