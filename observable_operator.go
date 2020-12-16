@@ -1183,7 +1183,7 @@ func (op *flatMapOperator) next(ctx context.Context, item Item, dst chan<- Item,
 }
 
 func (op *flatMapOperator) err(ctx context.Context, item Item, dst chan<- Item, operatorOptions operatorOptions) {
-	defaultErrorFuncOperator(ctx, item, dst, operatorOptions)
+	op.next(ctx, item, dst, operatorOptions)
 }
 
 func (op *flatMapOperator) end(_ context.Context, _ chan<- Item) {
