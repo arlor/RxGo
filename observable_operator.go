@@ -539,12 +539,23 @@ func (o *ObservableImpl) BufferWithTimeOrCount(timespan Duration, count int, opt
 
 		checkBuffer := func() {
 			mutex.Lock()
-			if len(buffer) != 0 {
-				if !Of(buffer).SendContext(ctx, next) {
-					mutex.Unlock()
-					return
+			switch {
+			case len(buffer) == 0:
+			case len(buffer) > count:
+				for {
+					// SendContext失败，就直接解锁退出，可以避免一次不必要的赋值操作
+					if !Of(buffer[:count]).SendContext(ctx, next) {
+						break
+					}
+					buffer = buffer[count:]
+					if len(buffer) < count {
+						break
+					}
 				}
-				buffer = make([]interface{}, 0)
+			default:
+				if Of(buffer).SendContext(ctx, next) {
+					buffer = make([]interface{}, 0)
+				}
 			}
 			mutex.Unlock()
 		}
